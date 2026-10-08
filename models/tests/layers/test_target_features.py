@@ -20,11 +20,11 @@ from torch import Tensor
 
 from anemoi.models.data import TensorLayout
 from anemoi.models.data.views import GriddedSourceView
-from anemoi.models.models.target_features import TARGET_FEATURE_REGISTRY
-from anemoi.models.models.target_features import CompositeTargetFeature
-from anemoi.models.models.target_features import DecodingTargetFeature
-from anemoi.models.models.target_features import create_decoding_target_features
-from anemoi.models.models.target_features import register_target_feature
+from anemoi.models.layers.target_features import TARGET_FEATURE_REGISTRY
+from anemoi.models.layers.target_features import CompositeTargetFeature
+from anemoi.models.layers.target_features import DecodingTargetFeature
+from anemoi.models.layers.target_features import create_decoding_target_features
+from anemoi.models.layers.target_features import register_target_feature
 
 
 @dataclass

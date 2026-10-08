@@ -33,6 +33,7 @@ from pytorch_lightning.utilities import rank_zero_only
 
 from anemoi.models.data import Batch
 from anemoi.models.data import SourceView
+from anemoi.models.distributed.graph import gather_tensor
 from anemoi.training.diagnostics.evaluation.geospatial.focus_area import build_spatial_mask
 from anemoi.training.diagnostics.evaluation.plotting.graph import graph_plot_fn as _default_graph_plot_fn
 from anemoi.training.diagnostics.evaluation.plotting.loss import loss_plot_fn as _default_loss_plot_fn
@@ -432,6 +433,15 @@ class BasePerBatchPlotCallback(BasePlotCallback):
         del pl_module, output
         return {}
 
+    def _prepare_batch(
+        self,
+        pl_module: pl.LightningModule,
+        batch: Batch,
+    ) -> Batch:
+        """Hook for callback-specific batch preparation before gathering."""
+        del pl_module
+        return batch
+
     def on_validation_batch_end(
         self,
         trainer: pl.Trainer,
@@ -442,6 +452,8 @@ class BasePerBatchPlotCallback(BasePlotCallback):
         **kwargs,
     ) -> None:
         if batch_idx % self.every_n_batches == 0:
+
+            batch = self._prepare_batch(pl_module, batch)
 
             # Gather grid-sharded tensors while preserving the Batch envelope
             # (layouts / statistics / coordinates) so downstream view-based access
@@ -914,23 +926,33 @@ class LossCurvePlot(BasePerBatchPlotCallback):
                     exp_log_tag=f"loss_sample_{dataset_name}{metric_name}_rank{pl_module.local_rank:01d}",
                 )
 
-    def on_validation_batch_end(
+    def _prepare_batch(
         self,
-        trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        output: TrainingStepOutput,
         batch: Batch,
-        batch_idx: int,
-    ) -> None:
-        if batch_idx % self.every_n_batches == 0:
-            self.loss = copy.deepcopy(pl_module.loss)
-            super().on_validation_batch_end(
-                trainer,
-                pl_module,
-                output,
-                pl_module.plot_adapter.prepare_loss_batch(batch),
-                batch_idx,
-            )
+    ) -> Batch:
+        """Snapshot the loss and gather any grid-sharded missing-value masks."""
+        self.loss = copy.deepcopy(pl_module.loss)
+        for dataset_name, copied_loss in self.loss.items():
+            original_leaves = pl_module.loss[dataset_name].iter_leaf_losses()
+            copied_leaves = copied_loss.iter_leaf_losses()
+            for original_leaf, copied_leaf in zip(original_leaves, copied_leaves, strict=True):
+                original_scaler = getattr(original_leaf, "scaler", None)
+                copied_scaler = getattr(copied_leaf, "scaler", None)
+                if original_scaler is None or copied_scaler is None or "nan_mask_weights" not in original_scaler:
+                    continue
+                nan_mask_weights = original_scaler.get_scaler_tensor("nan_mask_weights")
+                if nan_mask_weights.shape[pl_module.grid_dim] != 1:
+                    copied_scaler.update_scaler(
+                        "nan_mask_weights",
+                        gather_tensor(
+                            nan_mask_weights,
+                            pl_module.grid_dim,
+                            batch[dataset_name].shard_sizes,
+                            pl_module.model_comm_group,
+                        ),
+                    )
+        return pl_module.plot_adapter.prepare_loss_batch(batch)
 
 
 class BatchOutputPlot(BasePlotAdditionalMetrics):

@@ -26,13 +26,14 @@ from anemoi.models.data.batch import Batch
 from anemoi.models.data.views import GriddedSourceView
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.distributed.graph import shard_tensor
+from anemoi.models.distributed.shapes import DatasetShardSizes
 from anemoi.models.distributed.shapes import ShardSizes
 from anemoi.models.distributed.shapes import get_shard_sizes
 from anemoi.models.distributed.utils import model_is_distributed
 from anemoi.models.layers.bounding import build_boundings
 from anemoi.models.layers.graph import NodeTrainableParameters
-from anemoi.models.models.target_features import DecodingTargetFeature
-from anemoi.models.models.target_features import create_decoding_target_features
+from anemoi.models.layers.target_features import DecodingTargetFeature
+from anemoi.models.layers.target_features import create_decoding_target_features
 from anemoi.models.utils.config import COORDS_DIM
 from anemoi.models.utils.config import get_multiple_datasets_config
 from anemoi.utils.config import DotDict
@@ -135,7 +136,7 @@ class BaseGraphModel(nn.Module):
 
         model_config = DotDict(model_config)
         model_graph_config = DotDict(model_graph_config)
-        self._graph_name_hidden = model_config.model.model.hidden_nodes_name
+        self._graph_name_hidden = model_config.model.hidden_nodes_name
 
         static_graph_config, dynamic_graph_config = split_graph_config(
             model_graph_config, is_dataset_static, self._graph_name_hidden
@@ -150,42 +151,39 @@ class BaseGraphModel(nn.Module):
         self.dataset_names = list(data_indices.keys())
         self.is_dataset_static = is_dataset_static
         self.data_layouts = data_layouts
-        self._graph_name_hidden = model_config.model.model.hidden_nodes_name
 
-        self.latent_skip = model_config.model.model.latent_skip
+        self.latent_skip = model_config.model.latent_skip
 
-        self.node_attributes = NodeTrainableParameters(model_config.model.node_trainable_parameters, self._graph_data)
+        self.node_attributes = NodeTrainableParameters(model_config.node_trainable_parameters, self._graph_data)
 
         self.dynamic_node_attributes: dict[str, dict[str, object]] = {}
         self.dynamic_node_attribute_dims: dict[str, int] = {}
 
         self._configure_dynamic_node_attributes(dynamic_graph_config.nodes)
 
-        self._build_encoder_routing(model_config.model.encoders)
-        self._build_decoder_routing(model_config.model.decoders)
+        self._build_encoder_routing(model_config.encoders)
+        self._build_decoder_routing(model_config.decoders)
 
         self._calculate_shapes_and_indices(data_indices)
-
-        self._assert_model_routing()
 
         self._assert_model_routing()
         self._assert_matching_indices(data_indices)
         self._assert_hidden_nodes_name(self._graph_name_hidden)
 
         # build networks
-        self._build_networks(model_config.model, self._graph_data, dynamic_graph_config.edges)
+        self._build_networks(model_config, self._graph_data, dynamic_graph_config.edges)
 
         # build residual connection
         self._build_residual(
-            get_multiple_datasets_config(model_config.model.residual),
-            sparse_projector_config=model_config.model.get("sparse_projector", {}),
+            get_multiple_datasets_config(model_config.residual),
+            sparse_projector_config=model_config.get("sparse_projector", {}),
         )
 
         # build boundings
         # Instantiation of model output bounding functions (e.g., to ensure outputs like TP are positive definite)
         # Multi-dataset: create ModuleDict with ModuleList per dataset
         self.boundings = build_boundings(
-            get_multiple_datasets_config(model_config.model.get("bounding", [])),
+            get_multiple_datasets_config(model_config.get("bounding", [])),
             data_indices=self.data_indices,
             statistics=self.statistics,
         )
@@ -585,12 +583,11 @@ class BaseGraphModel(nn.Module):
         dataset_name: str,
         spatial_pre_processors: Optional[nn.ModuleDict],
         model_comm_group: Optional[ProcessGroup],
-    ) -> tuple[Tensor, ...]:
+        grid_shard_sizes: DatasetShardSizes | None,
+    ) -> tuple[tuple[Tensor, ...], DatasetShardSizes | None]:
         """Apply one dataset's spatial preprocessor to tensors sharing a source grid."""
-        grid_shard_sizes = None  # TODO: grid_shard_size will be carried with the data
-
         if spatial_pre_processors is None or dataset_name not in spatial_pre_processors:
-            return tensors
+            return tensors, grid_shard_sizes
 
         source_grid_shard_sizes = grid_shard_sizes[dataset_name] if grid_shard_sizes is not None else None
         projected_tensors = []
@@ -611,7 +608,7 @@ class BaseGraphModel(nn.Module):
 
         if grid_shard_sizes is not None:
             grid_shard_sizes[dataset_name] = output_grid_shard_sizes
-        return tuple(projected_tensors)
+        return tuple(projected_tensors), grid_shard_sizes
 
     def predict_step(
         self,
@@ -668,23 +665,38 @@ class BaseGraphModel(nn.Module):
                 for dataset_name in target.dataset_names:
                     target = self._shard_along_grid(target, dataset_name, model_comm_group)
 
+            grid_shard_sizes = {dataset_name: x[dataset_name].shard_sizes for dataset_name in dataset_names}
             processed_batch = x
             for dataset_name in dataset_names:
-                processed_batch = processed_batch.update_source(
-                    dataset_name,
-                    pre_processors[dataset_name](x[dataset_name], in_place=False, **kwargs),
-                )
-
-            # Spatial preprocessing: applied after grid sharding, before normalisation.
-            input_data = processed_batch
-            for dataset_name in dataset_names:
-                (projected_tensor,) = self._apply_spatial_preprocessor(
-                    (processed_batch[dataset_name],),
+                if spatial_pre_processors is None or dataset_name not in spatial_pre_processors:
+                    continue
+                view = processed_batch[dataset_name]
+                (projected_tensor,), grid_shard_sizes = self._apply_spatial_preprocessor(
+                    (view.data,),
                     dataset_name,
                     spatial_pre_processors,
                     model_comm_group,
+                    grid_shard_sizes,
                 )
-                input_data[dataset_name] = projected_tensor
+                output_shard_sizes = grid_shard_sizes[dataset_name]
+                coordinates = self._graph_data[dataset_name].x.to(projected_tensor.device)
+                if output_shard_sizes is not None:
+                    coordinates = shard_tensor(coordinates, 0, output_shard_sizes, model_comm_group)
+                processed_batch = processed_batch.update_source(
+                    dataset_name,
+                    view.clone(
+                        data=projected_tensor,
+                        coordinates=coordinates,
+                        coordinates_are_static=True,
+                        shard_sizes=output_shard_sizes,
+                    ),
+                )
+
+            for dataset_name in dataset_names:
+                processed_batch = processed_batch.update_source(
+                    dataset_name,
+                    pre_processors[dataset_name](processed_batch[dataset_name], in_place=False, **kwargs),
+                )
 
             # The target forcings condition the decoder, and need to go through the input processors
             processed_target = target

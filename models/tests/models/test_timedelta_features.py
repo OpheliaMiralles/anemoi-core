@@ -16,7 +16,7 @@ from anemoi.models.data.tensor_layout import TensorLayout
 from anemoi.models.data.views import TabularSourceView
 from anemoi.models.models.base import split_graph_config
 from anemoi.models.models.encoder_processor_decoder import AnemoiModelEncProcDec
-from anemoi.models.models.target_features import create_decoding_target_features
+from anemoi.models.layers.target_features import create_decoding_target_features
 from anemoi.utils.config import DotDict
 
 

@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 from torch_geometric.data import HeteroData
 
 import anemoi.models.models.base as base_model_module
+from anemoi.models.data import Batch
 from anemoi.models.data import TensorLayout
 from anemoi.models.models.base import BaseGraphModel
 
@@ -78,34 +79,29 @@ def _make_hierarchical_graph() -> HeteroData:
 def test_base_graph_model_builds_with_omegaconf_config(monkeypatch: pytest.MonkeyPatch) -> None:
     model_config = OmegaConf.create(
         {
+            "node_trainable_parameters": {"data": 0, "hidden": 0},
             "model": {
-                "node_trainable_parameters": {
-                    "data": 0,
-                    "hidden": 0,
-                },
-                "model": {
-                    "hidden_nodes_name": "hidden",
-                    "latent_skip": False,
-                },
-                "encoders": {
-                    0: {
-                        "source_datasets": ["data"],
-                        "dataset_fusing_strategy": "none",
-                        "mapper": {},
-                    },
-                },
-                "decoders": {
-                    0: {
-                        "target_datasets": ["data"],
-                        "target_node_features": ["coordinates"],
-                        "mapper": {},
-                    },
-                },
-                "residual": {
-                    "datasets": {"data": {"_target_": "anemoi.models.layers.residual.SkipConnection"}},
-                },
-                "bounding": {"datasets": {"data": []}},
+                "hidden_nodes_name": "hidden",
+                "latent_skip": False,
             },
+            "encoders": {
+                0: {
+                    "source_datasets": ["data"],
+                    "dataset_fusing_strategy": "none",
+                    "mapper": {},
+                },
+            },
+            "decoders": {
+                0: {
+                    "target_datasets": ["data"],
+                    "target_node_features": ["coordinates"],
+                    "mapper": {},
+                },
+            },
+            "residual": {
+                "datasets": {"data": {"_target_": "anemoi.models.layers.residual.SkipConnection"}},
+            },
+            "bounding": {"datasets": {"data": []}},
         },
     )
 
@@ -130,35 +126,30 @@ def test_base_graph_model_builds_with_omegaconf_config(monkeypatch: pytest.Monke
 def test_base_graph_model_accepts_omegaconf_hidden_node_lists(monkeypatch: pytest.MonkeyPatch) -> None:
     model_config = OmegaConf.create(
         {
+            "num_channels": 8,
+            "node_trainable_parameters": {"data": 0, "hidden": 0},
             "model": {
-                "num_channels": 8,
-                "node_trainable_parameters": {
-                    "data": 0,
-                    "hidden": 0,
-                },
-                "model": {
-                    "hidden_nodes_name": ["hidden_1", "hidden_2", "hidden_3"],
-                    "latent_skip": False,
-                },
-                "encoders": {
-                    0: {
-                        "source_datasets": ["data"],
-                        "dataset_fusing_strategy": "none",
-                        "mapper": {},
-                    },
-                },
-                "decoders": {
-                    0: {
-                        "target_datasets": ["data"],
-                        "target_node_features": ["coordinates"],
-                        "mapper": {},
-                    },
-                },
-                "residual": {
-                    "datasets": {"data": {"_target_": "anemoi.models.layers.residual.SkipConnection"}},
-                },
-                "bounding": {"datasets": {"data": []}},
+                "hidden_nodes_name": ["hidden_1", "hidden_2", "hidden_3"],
+                "latent_skip": False,
             },
+            "encoders": {
+                0: {
+                    "source_datasets": ["data"],
+                    "dataset_fusing_strategy": "none",
+                    "mapper": {},
+                },
+            },
+            "decoders": {
+                0: {
+                    "target_datasets": ["data"],
+                    "target_node_features": ["coordinates"],
+                    "mapper": {},
+                },
+            },
+            "residual": {
+                "datasets": {"data": {"_target_": "anemoi.models.layers.residual.SkipConnection"}},
+            },
+            "bounding": {"datasets": {"data": []}},
         },
     )
 
@@ -184,42 +175,56 @@ def test_base_graph_model_accepts_omegaconf_hidden_node_lists(monkeypatch: pytes
 # ---------------------------------------------------------------------------
 
 
-def _make_minimal_model():
+def _make_minimal_model(monkeypatch: pytest.MonkeyPatch):
     """Return a DummyGraphModel with a working predict_step."""
     model_config = OmegaConf.create(
         {
-            "model": {
-                "num_channels": 8,
-                "node_trainable_parameters": {"data": 0, "hidden": 0},
-                "model": {"hidden_nodes_name": "hidden", "latent_skip": False},
-                "encoders": {
-                    0: {
-                        "source_datasets": ["data"],
-                        "dataset_fusing_strategy": "not_supported",
-                        "mapper": {},
-                    },
+            "num_channels": 8,
+            "node_trainable_parameters": {"data": 0, "hidden": 0},
+            "model": {"hidden_nodes_name": "hidden", "latent_skip": False},
+            "encoders": {
+                0: {
+                    "source_datasets": ["data"],
+                    "dataset_fusing_strategy": "none",
+                    "mapper": {},
                 },
-                "decoders": {
-                    0: {
-                        "target_datasets": ["data"],
-                        "target_node_features": ["coordinates"],
-                        "mapper": {},
-                    },
-                },
-                "residual": {
-                    "datasets": {"data": {"_target_": "anemoi.models.layers.residual.SkipConnection"}},
-                },
-                "bounding": {"datasets": {"data": []}},
             },
+            "decoders": {
+                0: {
+                    "target_datasets": ["data"],
+                    "target_node_features": ["coordinates"],
+                    "mapper": {},
+                },
+            },
+            "residual": {
+                "datasets": {"data": {"_target_": "anemoi.models.layers.residual.SkipConnection"}},
+            },
+            "bounding": {"datasets": {"data": []}},
         }
     )
+    graph = _make_graph()
+    monkeypatch.setattr("anemoi.models.models.base.GraphCreator.create", lambda self: graph)
     return DummyGraphModel(
         model_config=model_config,
         data_indices=_make_data_indices(),
         statistics={"data": None},
         n_step_input=1,
         n_step_output=1,
-        graph_data=_make_graph(),
+        model_graph_config={"nodes": {name: {} for name in graph.node_types}, "edges": []},
+        is_dataset_static={"data": True},
+        data_layouts={"data": TensorLayout(batch=0, time=1, ensemble=2, grid=3, variables=4)},
+    )
+
+
+def _make_batch(data: dict[str, torch.Tensor], shard_sizes: dict | None = None) -> Batch:
+    return Batch(
+        data=data,
+        coordinates={name: torch.zeros(tensor.shape[-2], 2) for name, tensor in data.items()},
+        metadata={"static_coords": frozenset(data)},
+        shard_sizes={} if shard_sizes is None else shard_sizes,
+        layouts={name: TensorLayout(batch=0, time=1, ensemble=2, grid=3, variables=4) for name in data},
+        variables={name: [f"v{i}" for i in range(tensor.shape[-1])] for name, tensor in data.items()},
+        statistics={name: {} for name in data},
     )
 
 
@@ -247,29 +252,30 @@ def test_predict_step_spatial_preprocessors_called_before_normalization(monkeypa
             call_order.append("pre")
             return x
 
-    model = _make_minimal_model()
+    model = _make_minimal_model(monkeypatch)
 
     # Patch forward so predict_step can complete without a real graph network.
     BATCH, TIME, GRID, VARS = 1, 1, 4, 1
     dummy_out = torch.zeros(BATCH, 1, 1, GRID, VARS)  # (b, t, ens, grid, vars)
-    monkeypatch.setattr(model, "forward", lambda x, **kw: {"data": dummy_out})
+    monkeypatch.setattr(model, "forward", lambda x, **kw: x.with_data({"data": dummy_out}))
 
     spatial_processors = nn.ModuleDict({"data": RecordingSpatialProcessor()})
     pre_processors = {"data": RecordingPreProcessor()}
     post_processors = {"data": _identity_pre_processor()}
 
-    batch = {"data": torch.zeros(BATCH, TIME, GRID, VARS)}
+    batch = _make_batch({"data": torch.zeros(BATCH, TIME, 1, GRID, VARS)})
 
     with torch.no_grad():
         model.predict_step(
             batch,
+            target=batch,
             pre_processors=pre_processors,
             post_processors=post_processors,
             n_step_input=TIME,
             spatial_pre_processors=spatial_processors,
         )
 
-    assert call_order == ["spatial", "pre"], f"Expected spatial before pre, got order: {call_order}"
+    assert call_order == ["spatial", "pre", "pre"], f"Expected spatial before preprocessing, got: {call_order}"
 
 
 def test_predict_step_replaces_source_grid_shard_sizes(monkeypatch):
@@ -282,19 +288,24 @@ def test_predict_step_replaces_source_grid_shard_sizes(monkeypatch):
             assert grid_shard_sizes == source_grid_shard_sizes
             return x[..., :2, :], target_grid_shard_sizes
 
-    model = _make_minimal_model()
-    comm_group = object()
+    model = _make_minimal_model(monkeypatch)
+    comm_group = SimpleNamespace(size=lambda: 2)
 
-    def forward(x, *, grid_shard_sizes=None, **_kwargs):
-        assert grid_shard_sizes == {"data": target_grid_shard_sizes}
+    def forward(x, **_kwargs):
+        assert x["data"].shard_sizes == target_grid_shard_sizes
         return x
 
     monkeypatch.setattr(model, "forward", forward)
     monkeypatch.setattr(base_model_module, "get_shard_sizes", lambda *_args, **_kwargs: source_grid_shard_sizes)
     monkeypatch.setattr(base_model_module, "shard_tensor", lambda tensor, *_args, **_kwargs: tensor)
 
+    batch = _make_batch(
+        {"data": torch.zeros(1, 1, 1, 8, 1)},
+        shard_sizes={"data": source_grid_shard_sizes},
+    )
     out = model.predict_step(
-        {"data": torch.zeros(1, 1, 8, 1)},
+        batch,
+        target=batch,
         pre_processors={"data": _identity_pre_processor()},
         post_processors={"data": _identity_pre_processor()},
         n_step_input=1,
@@ -303,4 +314,35 @@ def test_predict_step_replaces_source_grid_shard_sizes(monkeypatch):
         spatial_pre_processors=nn.ModuleDict({"data": RegriddingSpatialProcessor()}),
     )
 
-    assert out["data"].shape[-2] == 2
+    assert out["data"].data.shape[-2] == 2
+
+
+def test_predict_step_skips_input_only_datasets(monkeypatch):
+    """Datasets without a decoder (input-only) have no output and must not be post-processed."""
+    model = _make_minimal_model(monkeypatch)
+
+    # `forcing` feeds an encoder but has no decoder, so forward only returns `data`
+    monkeypatch.setattr(
+        model,
+        "forward",
+        lambda x, **kw: x.with_data({"data": x["data"].data[:, -1:] + 1.0}),
+    )
+
+    processors = {"data": _identity_pre_processor(), "forcing": _identity_pre_processor()}
+    batch = _make_batch(
+        {
+            "data": torch.zeros(1, 1, 1, 4, 1),
+            "forcing": torch.zeros(1, 1, 1, 4, 2),
+        },
+    )
+
+    out = model.predict_step(
+        batch,
+        target=batch,
+        pre_processors=processors,
+        post_processors=processors,
+        n_step_input=1,
+    )
+
+    assert set(out.keys()) == {"data"}
+    assert torch.equal(out["data"].data, torch.ones(1, 1, 1, 4, 1))

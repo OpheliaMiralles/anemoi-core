@@ -181,6 +181,8 @@ class ScaleTensor(nn.Module):
 
     def get_scaler_tensor(self, name: str) -> torch.Tensor:
         """Return a scaler from either explicit runtime state or registered buffers."""
+        if name in self._tensors:
+            return self._tensors[name][1]
         if name in self._runtime_scalers:
             return self._runtime_scalers[name]
         if name in self._buffers:

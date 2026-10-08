@@ -190,22 +190,6 @@ class AnemoiModelInterface(torch.nn.Module):
                 self.pre_processors_tendencies[dataset_name] = pre_tend
                 self.post_processors_tendencies[dataset_name] = post_tend
 
-        # Spatial preprocessors (e.g. CrossGridProjector for downscaling).
-        # Keyed by dataset name; empty by default so existing models are unaffected.
-        # Built from optional config.data.datasets.<dataset_name>.spatial_processor entries.
-        self.spatial_pre_processors: torch.nn.ModuleDict = torch.nn.ModuleDict()
-        for dataset_name, dataset_config in data_config.items():
-            sp_config = getattr(dataset_config, "spatial_processor", None)
-            if sp_config is None:
-                continue
-            projector = instantiate(sp_config, graph=self.graph_data, _recursive_=False)
-            if not isinstance(projector, SpatialPreprocessor):
-                raise TypeError(
-                    f"datasets.{dataset_name}.spatial_processor must instantiate a SpatialPreprocessor, "
-                    f"got {type(projector)}"
-                )
-            self.spatial_pre_processors[dataset_name] = projector
-
         # Instantiate the model
         # Only pass _target_ and _convert_ from model config to avoid passing nested model settings as kwargs.
         model_instantiate_config = {
@@ -214,7 +198,7 @@ class AnemoiModelInterface(torch.nn.Module):
         }
         self.model = instantiate(
             model_instantiate_config,
-            model_config=self.config,
+            model_config=self.config.model,
             model_graph_config=self.config.graph,
             data_indices=self.data_indices,
             statistics=self.statistics,
@@ -224,6 +208,20 @@ class AnemoiModelInterface(torch.nn.Module):
             n_step_output=self.n_step_output,
             _recursive_=False,  # Disables recursive instantiation by Hydra
         )
+
+        # Spatial preprocessors (e.g. CrossGridProjector for downscaling).
+        self.spatial_pre_processors: torch.nn.ModuleDict = torch.nn.ModuleDict()
+        for dataset_name, dataset_config in data_config.items():
+            sp_config = getattr(dataset_config, "spatial_processor", None)
+            if sp_config is None:
+                continue
+            projector = instantiate(sp_config, graph=self.model._graph_data, _recursive_=False)
+            if not isinstance(projector, SpatialPreprocessor):
+                raise TypeError(
+                    f"datasets.{dataset_name}.spatial_processor must instantiate a SpatialPreprocessor, "
+                    f"got {type(projector)}"
+                )
+            self.spatial_pre_processors[dataset_name] = projector
 
         # Use the forward method of the model directly
         self.forward = self.model.forward

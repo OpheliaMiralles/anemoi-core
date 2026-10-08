@@ -569,6 +569,7 @@ class TransportTraining(BaseTransportTraining):
     ) -> TrainingStepOutput:
         """Run one training or validation step for the selected transport objective."""
         x = self.preprocess_inputs(self.task.get_inputs(batch, data_indices=self.data_indices))
+        self._prepare_loss_scalers()
         prepared_target = self.prediction_mode.prepare_target(batch, x)
         prepared_objective = self.transport_objective.prepare(prepared_target)
 
