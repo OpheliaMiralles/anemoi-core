@@ -20,15 +20,15 @@ import hydra
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from hydra.utils import get_class
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 from packaging import version
 from pytorch_lightning.loggers.logger import Logger
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from anemoi.models.utils.config import get_multiple_datasets_config
+from anemoi.training.checkpoint.runner import checkpoint_pipeline_configured
+from anemoi.training.checkpoint.runner import run_checkpoint_pipeline
 from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
 from anemoi.training.diagnostics.callbacks import CallbacksContext
 from anemoi.training.diagnostics.callbacks import get_callbacks
@@ -39,8 +39,6 @@ from anemoi.training.schemas.base_schema import BaseSchema
 from anemoi.training.schemas.base_schema import UnvalidatedBaseSchema
 from anemoi.training.schemas.base_schema import convert_to_omegaconf
 from anemoi.training.tasks.base import BaseTask
-from anemoi.training.utils.checkpoint import freeze_submodule_by_name
-from anemoi.training.utils.checkpoint import transfer_learning_loading
 from anemoi.training.utils.compile import prepare_compilation
 from anemoi.training.utils.hydra import instantiate_with_runtime_kwargs
 from anemoi.training.utils.jsonify import map_config_to_primitives
@@ -98,17 +96,13 @@ class AnemoiTrainer(ABC):
                 )
 
         self.start_from_checkpoint = (
-            bool(self.config.training.run_id)
-            or bool(self.config.training.fork_run_id)
-            or bool(self.config.system.input.warm_start)
+            OmegaConf.select(self.config, "training.checkpoint.source", default=None) is not None
         )
         LOGGER.info("Starting from checkpoint: %s", self.start_from_checkpoint)
 
-        self.load_weights_only = self.config.training.load_weights_only
         self.parent_uuid = None
 
-        self.config.training.run_id = self.run_id
-        LOGGER.info("Run id: %s", self.config.training.run_id)
+        LOGGER.info("Run id: %s", self.run_id)
 
         # Get the server2server lineage
         self._get_server2server_lineage()
@@ -216,16 +210,22 @@ class AnemoiTrainer(ABC):
         loaded_datasets = []
         initialized_datasets = []
 
-        # Check if checkpoint has multi-dataset format
-        if not isinstance(model._ckpt_model_name_to_index, dict):
+        ckpt_name_to_index = getattr(model, "_ckpt_model_name_to_index", None)
+        if not isinstance(ckpt_name_to_index, dict):
             return
+
+        training_config = getattr(getattr(self, "config", None), "training", {})
+        allow_subset = bool(training_config.get("allow_variable_subset", False))
 
         # Validate each dataset in current config against checkpoint
         for dataset_name, data_indices in self.data_indices.items():
-            if dataset_name in model._ckpt_model_name_to_index:
+            if dataset_name in ckpt_name_to_index:
                 # Dataset found in checkpoint - validate variables match
-                ckpt_name_to_index = model._ckpt_model_name_to_index[dataset_name]
-                data_indices.compare_variables(ckpt_name_to_index, data_indices.name_to_index)
+                data_indices.compare_variables(
+                    ckpt_name_to_index[dataset_name],
+                    data_indices.name_to_index,
+                    allow_subset=allow_subset,
+                )
                 loaded_datasets.append(dataset_name)
             else:
                 # Dataset not found in checkpoint - will be randomly initialized
@@ -236,7 +236,7 @@ class AnemoiTrainer(ABC):
                 initialized_datasets.append(dataset_name)
 
         # Check for datasets in checkpoint but not in config
-        ignored_datasets = [name for name in model._ckpt_model_name_to_index if name not in self.data_indices]
+        ignored_datasets = [name for name in ckpt_name_to_index if name not in self.data_indices]
         if ignored_datasets:
             for ignored_dataset in ignored_datasets:
                 LOGGER.warning(
@@ -279,7 +279,12 @@ class AnemoiTrainer(ABC):
         compat_options = (
             OmegaConf.to_container(compat_cfg, resolve=True) if OmegaConf.is_config(compat_cfg) else (compat_cfg or {})
         )
-        check_variables_metadata_compatibility(ckpt_variables_metadata, self.datamodule.metadata, **compat_options)
+        check_variables_metadata_compatibility(
+            ckpt_variables_metadata,
+            self.datamodule.metadata,
+            allow_subset=bool(self.config.training.get("allow_variable_subset", False)),
+            **compat_options,
+        )
 
     @cached_property
     def model(self) -> pl.LightningModule:
@@ -295,62 +300,48 @@ class AnemoiTrainer(ABC):
             "supporting_arrays": self.supporting_arrays,
         }
 
-        training_method_cfg = self.config.training.method
-        training_method_cls = get_class(training_method_cfg._target_)
-        model = instantiate_with_runtime_kwargs(training_method_cfg, **kwargs)  # Task -> pl.LightningModule
+        model = instantiate_with_runtime_kwargs(self.config.training.method, **kwargs)
 
-        # Load the model weights
-        if self.load_weights_only:
-            # Sanify the checkpoint for transfer learning
-            if self.config.training.transfer_learning:
-                LOGGER.info("Loading weights with Transfer Learning from %s", self.last_checkpoint)
-                model = transfer_learning_loading(model, self.last_checkpoint)
-            else:
-                LOGGER.info("Restoring only model weights from %s", self.last_checkpoint)
-                # pop data_indices so that the data indices on the checkpoint do not get overwritten
-                # by the data indices from the new config
-                kwargs.pop("data_indices")
-
-                # Load to CPU explictly, to avoid loading entire model on GPU initially
-                # Modifications to the model occur on cpu,
-                # The model will be sent to GPU when trainer.fit() is called
-                model = training_method_cls.load_from_checkpoint(
-                    self.last_checkpoint,
-                    **kwargs,
-                    strict=False,
-                    weights_only=False,  # required for Pytorch Lightning 2.6
-                    map_location="cpu",
-                )
-
-            model.data_indices = self.data_indices
-            # Validate data indices between checkpoint and current config
-            self._validate_transfer_learning_datasets(model)
-            # Validate variable units between checkpoint and current dataset
-            self._validate_transfer_learning_units(model)
-
-        if hasattr(self.config.training, "submodules_to_freeze"):
-            # Freeze the chosen model weights
-            LOGGER.info("The following submodules will NOT be trained: %s", self.config.training.submodules_to_freeze)
-            for submodule_name in self.config.training.submodules_to_freeze:
-                is_found = freeze_submodule_by_name(model.model.model, submodule_name)
-                if is_found:
-                    LOGGER.info("%s frozen successfully.", submodule_name.upper())
-                else:
-                    LOGGER.warning("Submodule %s not found. SKIPPING freezing.", submodule_name)
+        if checkpoint_pipeline_configured(self.config):
+            return self._load_via_checkpoint_pipeline(model)
 
         return model
+
+    def _load_via_checkpoint_pipeline(self, model: pl.LightningModule) -> pl.LightningModule:
+        """Acquire and load a checkpoint through the upstream checkpoint pipeline."""
+        result = run_checkpoint_pipeline(
+            model,
+            self.config,
+            parent_run_server2server=getattr(self, "parent_run_server2server", None),
+            fork_run_server2server=getattr(self, "fork_run_server2server", None),
+            load_checkpoint=self.start_from_checkpoint,
+        )
+        self._resolved_checkpoint_path = result.ckpt_path
+        if result.weights_loaded:
+            result.model.data_indices = self.data_indices
+            self._validate_transfer_learning_datasets(result.model)
+            self._validate_transfer_learning_units(result.model)
+        return result.model
+
+    @cached_property
+    def _run_identity(self) -> tuple[str | None, str | None]:
+        from anemoi.training.checkpoint.sources.run import run_identity_from_config
+
+        return run_identity_from_config(self.config)
+
+    @property
+    def _resume_run_id(self) -> str | None:
+        return self._run_identity[0]
+
+    @property
+    def _fork_run_id(self) -> str | None:
+        return self._run_identity[1]
 
     @cached_property
     def run_id(self) -> str:
         """Unique identifier for the current run."""
-        # When a run ID is provided
-        if self.config.training.run_id and not self.config.training.fork_run_id:
-            # Return the provided run ID - reuse run_id if resuming run
-            return self.config.training.run_id
-
-        # When a run ID has been created externally and we want to fork a run
-        if self.config.training.run_id and self.config.training.fork_run_id:
-            return self.config.training.run_id
+        if self._resume_run_id:
+            return self._resume_run_id
 
         # When we rely on mlflow to create a new run ID
         if self.logger and self.logger.logger_name == "mlflow":
@@ -362,41 +353,13 @@ class AnemoiTrainer(ABC):
 
         return str(uuid.uuid4())
 
-    def _get_warm_start_checkpoint(self) -> Path | None:
-        """Returns the warm start checkpoint path if specified."""
-        raw_path = self.config.system.input.warm_start
-        if not raw_path:
-            return None
-
-        warm_start_path = Path(raw_path)
-
-        if not warm_start_path.is_file():
-            msg = f"Warm start checkpoint not found: {warm_start_path}"
-            raise FileNotFoundError(msg)
-        return warm_start_path
-
-    def _get_checkpoint_directory(self, fork_id: str) -> Path:
-        """Returns the directory where checkpoints are stored."""
-        return Path(self.config.system.output.checkpoints.root.parent, fork_id or self.lineage_run) / "last.ckpt"
-
     @cached_property
     def last_checkpoint(self) -> Path | None:
-        """Path to the last checkpoint."""
+        """Checkpoint path passed to Lightning when resuming full training state."""
         if not self.start_from_checkpoint:
             return None
-
-        fork_id = self.fork_run_server2server or self.config.training.fork_run_id
-        checkpoint = self._get_warm_start_checkpoint() or self._get_checkpoint_directory(fork_id)
-        # Check if the last checkpoint exists
-        if checkpoint.exists():
-            LOGGER.info("Resuming training from last checkpoint: %s", checkpoint)
-            return checkpoint
-
-        if rank_zero_only.rank == 0:
-            msg = "Could not find last checkpoint: %s", checkpoint
-            raise RuntimeError(msg)
-
-        return None
+        _ = self.model
+        return getattr(self, "_resolved_checkpoint_path", None)
 
     @cached_property
     def callbacks(self) -> list[pl.callbacks.Callback]:
@@ -446,9 +409,10 @@ class AnemoiTrainer(ABC):
     @cached_property
     def _logger_kwargs(self) -> dict:
         """Shared keyword arguments for all loggers."""
+        run_id, fork_run_id = self._run_identity
         return {
-            "run_id": self.config.training.run_id,
-            "fork_run_id": self.config.training.fork_run_id,
+            "run_id": run_id,
+            "fork_run_id": fork_run_id,
             "paths": self.config.system.output,
             "logger_config": self.config.diagnostics.log,
         }
@@ -572,9 +536,9 @@ class AnemoiTrainer(ABC):
                 self.lineage_run,
             )
             self.config.system.output.plots = Path(self.config.system.output.plots, self.lineage_run)
-        elif self.config.training.fork_run_id:
+        elif self._fork_run_id:
             # WHEN USING MANY NODES/GPUS
-            self.lineage_run = self.parent_run_server2server or self.config.training.fork_run_id
+            self.lineage_run = self.parent_run_server2server or self._fork_run_id
             # Only rank non zero in the forked run will go here
             self.config.system.output.checkpoints.root = Path(
                 self.config.system.output.checkpoints.root,
@@ -584,7 +548,6 @@ class AnemoiTrainer(ABC):
         LOGGER.info("Checkpoints path: %s", self.config.system.output.checkpoints)
         LOGGER.info("Plots path: %s", self.config.system.output.plots)
 
-    @rank_zero_only
     def _check_dry_run(self) -> None:
         """Check if the run ID is dry, e.g. without a checkpoint.
 
@@ -598,7 +561,7 @@ class AnemoiTrainer(ABC):
                 self.mlflow_logger._parent_dry_run and not Path(self.config.system.output.checkpoints.root).is_dir()
             )
             self.start_from_checkpoint = (
-                False if (self.dry_run and not bool(self.config.training.fork_run_id)) else self.start_from_checkpoint
+                False if (self.dry_run and not bool(self._fork_run_id)) else self.start_from_checkpoint
             )
             LOGGER.info("Dry run: %s", self.dry_run)
 
@@ -643,7 +606,7 @@ class AnemoiTrainer(ABC):
 
         params["model"] = self.model
         params["datamodule"] = self.datamodule
-        params["ckpt_path"] = None if (self.load_weights_only) else self.last_checkpoint
+        params["ckpt_path"] = self.last_checkpoint
 
         if version.parse("2.6.0") <= PL_VERSION:
             params["weights_only"] = False

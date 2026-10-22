@@ -769,7 +769,6 @@ system:
     loss_matrices_path: null
     truncation: null
     truncation_inv: null
-    warm_start: null
   hardware:
     accelerator: auto
     num_gpus_per_node: ${oc.decode:${oc.env:SLURM_GPUS_PER_NODE,1}}
@@ -1182,10 +1181,6 @@ training:
     lr: 6.25e-05
     pl_lr_scheduler:
       interval: step
-  run_id: null
-  fork_run_id: null
-  transfer_learning: false
-  load_weights_only: false
   deterministic: false
   precision: bf16-mixed
   accum_grad_batches: 1
@@ -1204,7 +1199,6 @@ training:
   loss_gradient_scaling: false
   max_epochs: 100
   max_steps: 75000
-  submodules_to_freeze: []
   training_loss:
     datasets:
       era:

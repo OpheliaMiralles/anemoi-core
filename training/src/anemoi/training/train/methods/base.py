@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import importlib
 import logging
 from abc import ABC
 from abc import abstractmethod
@@ -30,6 +29,9 @@ from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.distributed.balanced_partition import get_partition_range
 from anemoi.models.interface import AnemoiModelInterface
 from anemoi.models.utils.config import get_multiple_datasets_config
+from anemoi.training.checkpoint.loading.base import apply_checkpoint_corrections
+from anemoi.training.checkpoint.loading.base import extract_checkpoint_variables_metadata
+from anemoi.training.checkpoint.loading.base import preserve_anemoi_metadata
 from anemoi.training.losses import get_loss_function
 from anemoi.training.losses.base import BaseLoss
 from anemoi.training.losses.loss import get_metric_ranges
@@ -51,12 +53,6 @@ from anemoi.training.utils.seeding import get_base_seed
 from anemoi.training.utils.seeding import seed_random_generators
 from anemoi.training.utils.seeding import set_base_seed
 from anemoi.training.utils.variables_metadata import ExtractVariableGroupAndLevel
-from anemoi.training.utils.variables_metadata import extract_variables_metadata_from_checkpoint
-
-_chunking_fix_migration = importlib.import_module("anemoi.models.migrations.scripts.1762857428_chunking_fix").migrate
-_trainable_edge_perm_fix_migration = importlib.import_module(
-    "anemoi.models.migrations.scripts.1779202136_trainable_edge_perm_fix",
-).migrate
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -496,37 +492,22 @@ class BaseTrainingModule(pl.LightningModule, ABC):
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         checkpoint["task_state"] = self.task.training_runtime_state_dict()
 
-    def on_load_checkpoint(self, checkpoint: torch.nn.Module) -> None:
-        # Apply migrations to handle state_dict key changes from older checkpoints.
-        # These are idempotent: already-migrated checkpoints are unaffected.
-        _trainable_edge_perm_fix_migration(checkpoint, model=self)
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        self.task.load_training_runtime_state_dict(checkpoint.get("task_state", {}))
 
-        self._ckpt_model_name_to_index = {
-            dataset_name: data_indices.name_to_index
-            for dataset_name, data_indices in checkpoint["hyper_parameters"]["data_indices"].items()
-        }
+        trainer = getattr(self, "_trainer", None)
+        corrected = apply_checkpoint_corrections(checkpoint, self, self.config)
+        if corrected is not checkpoint:
+            checkpoint.clear()
+            checkpoint.update(corrected)
 
-        if not self.config.training.load_weights_only:
-            # Checkpoint conversion loads the module without creating a Trainer; only a
-            # training run that continues from the checkpoint takes over its seed.
-            trainer = getattr(self, "_trainer", None)
-            if trainer is not None:
-                self._restore_base_seed(checkpoint)
-            self.task.load_training_runtime_state_dict(checkpoint.get("task_state", {}))
+        if trainer is not None:
+            self._restore_base_seed(checkpoint)
+        if trainer is not None and trainer.datamodule is not None:
+            trainer.datamodule.sync_dataset_state()
 
-            # Anemoi constructs the task and datasets from the config before Lightning
-            # restores their checkpoint state. Now that the checkpoint rollout is restored,
-            # update any constructed datasets so workers load the required input and target
-            # time steps. Checkpoint conversion creates no datamodule either, so only
-            # synchronize if a datamodule is attached.
-            if trainer is not None and trainer.datamodule is not None:
-                trainer.datamodule.sync_dataset_state()
-
-        # Extract variables_metadata for unit compatibility check
-        self._ckpt_variables_metadata = extract_variables_metadata_from_checkpoint(
-            checkpoint,
-            self._ckpt_model_name_to_index,
-        )
+        preserve_anemoi_metadata(self, checkpoint)
+        extract_checkpoint_variables_metadata(self, checkpoint)
 
     def _restore_base_seed(self, checkpoint: dict) -> None:
         """Continue with the checkpoint's base seed, unless ``training.seed`` sets one.

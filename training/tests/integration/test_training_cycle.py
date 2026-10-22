@@ -667,7 +667,7 @@ def test_training_cycle_temporal_downscaler(
     get_test_archive: GetTestArchive,
     partial_metadata_schema: dict[str, Any],
 ) -> None:
-    """Full training-cycle smoke-test for the temporal downscaler task."""
+    """Full training-cycle integration test for the temporal downscaler task."""
     cfg, url = temporal_downscaler_config
     get_test_archive(url)
     trainer = AnemoiTrainer(cfg)

@@ -58,8 +58,15 @@ class DummyIndexWithCompare(DummyIndex):
         super().__init__()
         self.compare_called_with: list[tuple] = []
 
-    def compare_variables(self, ckpt_index: dict, data_index: dict) -> None:
+    def compare_variables(
+        self,
+        ckpt_index: dict,
+        data_index: dict,
+        *,
+        allow_subset: bool = False,
+    ) -> None:
         """Track that compare was called."""
+        del allow_subset
         self.compare_called_with.append((ckpt_index, data_index))
 
 
@@ -134,9 +141,7 @@ def _make_dummy_module(model: torch.nn.Module) -> DummyTrainingModule:
     module.task = Forecaster(multistep_input=1, multistep_output=1, timestep="6h")
     module.model = model
     module._device = torch.device("cpu")
-    module.config = SimpleNamespace(
-        training=SimpleNamespace(seed=None, load_weights_only=False),
-    )
+    module.config = SimpleNamespace(training=SimpleNamespace(seed=None))
     module._set_hparams({"metadata": _run_metadata()})
     return module
 
@@ -305,7 +310,6 @@ def test_validate_transfer_learning_remove_dataset() -> None:
 def _make_module_with_forecaster_task(
     rollout_cfg: dict,
     *,
-    load_weights_only: bool = False,
     seed: int | None = None,
 ) -> tuple[DummyTrainingModule, Forecaster]:
     """Build a minimal DummyTrainingModule whose task is a Forecaster."""
@@ -313,12 +317,7 @@ def _make_module_with_forecaster_task(
     torch.nn.Module.__init__(module)
     task = Forecaster(multistep_input=1, multistep_output=1, timestep="6h", rollout=rollout_cfg)
     module.task = task
-    module.config = SimpleNamespace(  # type: ignore[assignment]
-        training=SimpleNamespace(
-            seed=seed,
-            load_weights_only=load_weights_only,
-        ),
-    )
+    module.config = SimpleNamespace(training=SimpleNamespace(seed=seed))  # type: ignore[assignment]
     module._set_hparams({"metadata": _run_metadata()})
     return module, task
 
@@ -362,32 +361,6 @@ def test_on_train_start_logs_effective_rollout_step(caplog: pytest.LogCaptureFix
     BaseTrainingModule.on_train_start(module)
 
     assert caplog.messages == ["Effective task rollout step: 2."]
-
-
-def test_on_load_checkpoint_load_weights_only_starts_rollout_schedule_from_config() -> None:
-    """Loading only weights starts the rollout schedule at rollout.start."""
-    module, task = _make_module_with_forecaster_task(
-        {"start": 2, "epoch_increment": 2, "maximum": 5},
-        load_weights_only=True,
-    )
-
-    checkpoint = {
-        "task_state": {"rollout": {"step": 4, "last_increased_epoch": 3}},
-        "hyper_parameters": _resume_hyper_parameters(),
-        "state_dict": {},
-    }
-    BaseTrainingModule.on_load_checkpoint(module, checkpoint)
-
-    assert task.rollout.step == 2
-    assert task.rollout._last_increased_epoch == -1
-
-    task.on_train_epoch_end(0)
-    assert task.rollout.step == 2
-    assert task.rollout._last_increased_epoch == -1
-
-    task.on_train_epoch_end(1)
-    assert task.rollout.step == 3
-    assert task.rollout._last_increased_epoch == 1
 
 
 class _RecordingDataModule:
@@ -697,22 +670,6 @@ def test_on_load_checkpoint_keeps_configured_base_seed() -> None:
 
     assert get_base_seed() == 1234
     assert module.hparams["metadata"] == _run_metadata(base_seed=1234)
-
-
-def test_on_load_checkpoint_load_weights_only_keeps_run_base_seed() -> None:
-    """Loading only the weights starts a new run, which keeps its own seed."""
-    seeding.set_base_seed(7)
-    module, _ = _make_module_with_forecaster_task(
-        {"start": 1, "epoch_increment": 1, "maximum": 5},
-        load_weights_only=True,
-    )
-    _attach_trainer(module)
-    checkpoint = {"hyper_parameters": _resume_hyper_parameters(base_seed=4321), "state_dict": {}}
-
-    BaseTrainingModule.on_load_checkpoint(module, checkpoint)
-
-    assert get_base_seed() == 7
-    assert module.hparams["metadata"] == _run_metadata(base_seed=7)
 
 
 def test_on_load_checkpoint_without_stored_base_seed_keeps_run_base_seed(caplog: pytest.LogCaptureFixture) -> None:
