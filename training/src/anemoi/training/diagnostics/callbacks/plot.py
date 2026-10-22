@@ -1076,6 +1076,26 @@ class BatchOutputPlot(BasePlotAdditionalMetrics):
                     auxiliary_output=auxiliary_output,
                     members=self._get_process_members(pl_module),
                 )
+                input_latlons, x = self.focus_mask.apply(
+                    pl_module.model.model._graph_data,
+                    input_latlons,
+                    x,
+                )
+                if auxiliary is not None:
+                    output_latlons, y_true, y_pred, auxiliary = self.focus_mask.apply(
+                        pl_module.model.model._graph_data,
+                        output_latlons,
+                        y_true,
+                        y_pred,
+                        auxiliary,
+                    )
+                else:
+                    output_latlons, y_true, y_pred = self.focus_mask.apply(
+                        pl_module.model.model._graph_data,
+                        output_latlons,
+                        y_true,
+                        y_pred,
+                    )
                 fig = self.plot_fn(
                     **spatial_inputs,
                     x=x,

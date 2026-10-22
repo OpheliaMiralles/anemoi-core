@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -72,6 +73,33 @@ def test_factory_handles_validated_observation_config(monkeypatch: pytest.Monkey
     assert isinstance(reader, TabularDataReader)
     assert reader.max_rows_per_window == 3
     np.testing.assert_array_equal(reader.dates, dataset.dates[:2])
+
+
+def test_tabular_reader_concatenates_consecutive_stores(monkeypatch: pytest.MonkeyPatch) -> None:
+    datasets = []
+    for date in ("2020-01-01T00", "2020-01-01T03"):
+        dataset = _make_obs_reader(_make_obs_payload(n=2, v=3, n_times=1)).data
+        dataset.dates = np.array([date], dtype="datetime64[h]")
+        dataset.frequency = datetime.timedelta(hours=3)
+        dataset.window = "(-3h,+0h]"
+        datasets.append(dataset)
+    monkeypatch.setattr("anemoi.datasets.open_dataset", MagicMock(side_effect=datasets))
+
+    reader = TabularDataReader(
+        dataset_config={
+            "dataset": [
+                {"dataset": "observations-1", "end": "2020-01-01T00:00:00"},
+                {"dataset": "observations-2", "start": "2020-01-01T03:00:00"},
+            ],
+            "frequency": "3h",
+            "window": "(-3h,+0h]",
+        },
+    )
+    sample = reader.get_sample(0, slice(0, 2))
+
+    np.testing.assert_array_equal(reader.dates, np.array(["2020-01-01T00", "2020-01-01T03"], dtype="datetime64[h]"))
+    assert sample.data.shape == (1, 4, 3)
+    assert sample.boundaries == (slice(0, 2), slice(2, 4))
 
 
 def test_batch_collate_and_to() -> None:

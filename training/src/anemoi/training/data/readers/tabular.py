@@ -9,6 +9,7 @@
 
 import datetime
 import logging
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -18,10 +19,92 @@ from anemoi.models.data import TensorLayout
 from anemoi.models.data.sample import TabularSample
 from anemoi.models.data.sample import create_batched_struct
 from anemoi.training.data.readers.base import BaseAnemoiReader
+from anemoi.training.data.readers.utils import _normalize_dataset_config
 from anemoi.training.data.readers.utils import _to_local_window_shard_data
 from anemoi.training.utils.time_indices import TimeIndices
+from anemoi.training.utils.time_indices import normalize_time_indices
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _ConcatenatedTabularDataset:
+    """Expose consecutive tabular stores as one observation timeline."""
+
+    def __init__(
+        self,
+        datasets: list,
+        dates: list[np.ndarray],
+        start: datetime.datetime | int | None,
+        end: datetime.datetime | int | None,
+    ) -> None:
+        self.datasets = datasets
+        self._lengths = np.asarray([len(value) for value in dates], dtype=np.int64)
+        all_dates = np.concatenate(dates)
+        selected = np.ones(len(all_dates), dtype=bool)
+        if start is not None and not isinstance(start, int):
+            selected &= all_dates >= np.datetime64(start)
+        if end is not None and not isinstance(end, int):
+            selected &= all_dates <= np.datetime64(end)
+        self._positions = np.flatnonzero(selected)
+        self.dates = all_dates[selected]
+
+        variables = [dataset.variables for dataset in datasets]
+        if any(value != variables[0] for value in variables[1:]):
+            msg = f"Concatenated tabular datasets have different variables: {variables}"
+            raise ValueError(msg)
+        if len(self.dates) > 1:
+            expected = np.timedelta64(int(datasets[0].frequency.total_seconds()), "s")
+            if np.any(np.diff(self.dates) != expected):
+                msg = "Concatenated tabular datasets must form one continuous timeline."
+                raise ValueError(msg)
+
+        self.variables = variables[0]
+        self.name_to_index = datasets[0].name_to_index
+        self.statistics = datasets[0].statistics
+        self.frequency = datasets[0].frequency
+        self.window = datasets[0].window
+        self.missing = set()
+
+    def __len__(self) -> int:
+        return len(self.dates)
+
+    def __getitem__(self, index: int | slice | list[int] | np.ndarray) -> SimpleNamespace:
+        positions = np.atleast_1d(np.arange(len(self))[index])
+        positions = self._positions[positions]
+        dataset_indices = np.searchsorted(np.cumsum(self._lengths), positions, side="right")
+        offsets = np.r_[0, np.cumsum(self._lengths)]
+
+        values = []
+        latitudes = []
+        longitudes = []
+        timedeltas = []
+        boundaries = []
+        offset = 0
+        run_start = 0
+        while run_start < len(positions):
+            dataset_index = dataset_indices[run_start]
+            run_end = run_start + 1
+            while run_end < len(positions) and dataset_indices[run_end] == dataset_index:
+                run_end += 1
+            local_positions = positions[run_start:run_end] - offsets[dataset_index]
+            result = self.datasets[dataset_index][normalize_time_indices(local_positions)]
+            values.append(result.data)
+            latitudes.append(result.latitudes)
+            longitudes.append(result.longitudes)
+            timedeltas.append(result.timedeltas)
+            for boundary in result.boundaries:
+                length = boundary.stop - boundary.start
+                boundaries.append(slice(offset, offset + length))
+                offset += length
+            run_start = run_end
+
+        return SimpleNamespace(
+            data=np.concatenate(values),
+            latitudes=np.concatenate(latitudes),
+            longitudes=np.concatenate(longitudes),
+            timedeltas=np.concatenate(timedeltas),
+            boundaries=tuple(boundaries),
+        )
 
 
 class TabularDataReader(BaseAnemoiReader):
@@ -45,7 +128,29 @@ class TabularDataReader(BaseAnemoiReader):
         max_rows_per_window: int | None = None,
     ) -> None:
         """Initialize an observation reader with optional deterministic row selection."""
-        super().__init__(dataset_config=dataset_config, start=start, end=end)
+        from anemoi.datasets import open_dataset
+
+        source = self._open_options(_normalize_dataset_config(dataset_config), None, None)
+        members = source.get("dataset")
+        if isinstance(members, list):
+            common = {key: value for key, value in source.items() if key != "dataset"}
+            datasets = []
+            dates = []
+            for member in members:
+                member = {"dataset": member} if isinstance(member, str) else member
+                dataset = open_dataset(common | member)
+                member_dates = np.asarray(dataset.dates)
+                if member.get("start") is not None:
+                    member_dates = member_dates[member_dates >= np.datetime64(member["start"])]
+                if member.get("end") is not None:
+                    member_dates = member_dates[member_dates <= np.datetime64(member["end"])]
+                datasets.append(dataset)
+                dates.append(member_dates)
+            self.data = _ConcatenatedTabularDataset(datasets, dates, start, end)
+            self.reader_group_rank = 0
+            self.reader_group_size = 1
+        else:
+            super().__init__(dataset_config=dataset_config, start=start, end=end)
         self.row_filters = row_filters or {}
         self.max_rows_per_window = max_rows_per_window
         self._dates = self.data.dates

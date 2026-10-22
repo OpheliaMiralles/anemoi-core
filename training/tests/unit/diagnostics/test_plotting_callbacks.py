@@ -25,6 +25,7 @@ from anemoi.models.data import TensorLayout
 from anemoi.models.data.batch import Batch
 from anemoi.training.diagnostics.callbacks.plot import BatchOutputPlot
 from anemoi.training.diagnostics.callbacks.plot import LossCurvePlot
+from anemoi.training.diagnostics.callbacks.plot import PlottingSettings
 from anemoi.training.diagnostics.callbacks.plot_adapter import EnsemblePlotAdapterWrapper
 from anemoi.training.diagnostics.callbacks.plot_adapter import ForecasterPlotAdapter
 from anemoi.training.diagnostics.evaluation.plotting.batch_output import ensemble_plot_fn
@@ -473,9 +474,11 @@ def test_batch_output_plot_sparse_forwards_auxiliary_output() -> None:
         parameters=["a", "b"],
         accumulation_levels_plot=[0.5],
         dataset_names=["obs"],
+        focus_area={"latlon_bbox": [5.0, -180.0, 90.0, 360.0]},
+        plotting_settings=PlottingSettings(asynchronous=False),
     )
     callback.post_processors = {"obs": _IdentityProcessor()}
-    callback.plot_fn = MagicMock(return_value=MagicMock())
+    callback.plot_fn = MagicMock(spec=sample_plot_fn, return_value=MagicMock())
     callback._output_figure = MagicMock()
 
     pl_module = _make_pl_module_forecaster(validation_rollout=1)
@@ -508,6 +511,8 @@ def test_batch_output_plot_sparse_forwards_auxiliary_output() -> None:
     kwargs = callback.plot_fn.call_args.kwargs
     torch.testing.assert_close(torch.as_tensor(kwargs["y_pred"]), torch.full((3, 2), 2.0))
     torch.testing.assert_close(torch.as_tensor(kwargs["auxiliary"]), torch.full((3, 2), 3.0))
+    assert kwargs["x"].shape == (1, 2)
+    assert kwargs["latlons"].shape == (1, 2)
     assert kwargs["sparse"] is True
     assert kwargs["output_latlons"].shape == (3, 2)
 
