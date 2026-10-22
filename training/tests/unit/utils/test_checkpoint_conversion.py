@@ -43,6 +43,13 @@ def load_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 
 
 def _set_hyper_parameters(monkeypatch: pytest.MonkeyPatch, hyper_parameters: dict) -> None:
+    config = hyper_parameters["config"]
+    OmegaConf.update(
+        config,
+        "training.method._target_",
+        "anemoi.training.train.methods.base.BaseTrainingModule",
+        force_add=True,
+    )
     monkeypatch.setattr(torch, "load", lambda *_a, **_k: {"hyper_parameters": hyper_parameters})
 
 
